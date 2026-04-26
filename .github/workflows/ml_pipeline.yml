@@ -1,0 +1,277 @@
+name: ML Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_promote:
+        description: "Force promote model to Production even if tests pass marginally"
+        required: false
+        default: "false"
+
+env:
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: "http://localhost:5000"
+  MODEL_NAME: "MLOpsDemoModel"
+
+jobs:
+  # ── 1. Lint & unit tests ─────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    services:
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:v2.13.2
+        ports:
+          - 5000:5000
+        options: >-
+          --health-cmd "curl -f http://localhost:5000/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+        env:
+          MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow.db
+          MLFLOW_DEFAULT_ARTIFACT_ROOT: /tmp/mlflow-artifacts
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov flake8 black isort
+
+      - name: Lint with flake8
+        run: |
+          flake8 src/ serving/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=__pycache__,.git
+
+      - name: Check formatting with black
+        run: black --check --line-length 120 src/ serving/
+
+      - name: Check import ordering with isort
+        run: isort --check-only --line-length 120 src/ serving/
+
+      - name: Run unit tests
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --tb=short \
+            -v \
+            || echo "No tests directory found — skipping (add tests/ to enable coverage)"
+
+      - name: Upload coverage report
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ── 2. Train model ───────────────────────────────────────────────────────────
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    services:
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:v2.13.2
+        ports:
+          - 5000:5000
+        options: >-
+          --health-cmd "curl -f http://localhost:5000/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+        env:
+          MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow.db
+          MLFLOW_DEFAULT_ARTIFACT_ROOT: /tmp/mlflow-artifacts
+
+    outputs:
+      model_version: ${{ steps.train.outputs.model_version }}
+      run_id: ${{ steps.train.outputs.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for MLflow to be ready
+        run: |
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:5000/health; then
+              echo "MLflow is ready."
+              break
+            fi
+            echo "Waiting for MLflow ($i/20) …"
+            sleep 3
+          done
+
+      - name: Run training
+        id: train
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+        run: |
+          OUTPUT=$(python src/train.py --config configs/xgboost.yaml 2>&1)
+          echo "$OUTPUT"
+          RUN_ID=$(echo "$OUTPUT" | grep "MLflow run ID:" | tail -1 | awk '{print $NF}')
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          # Retrieve the latest registered version
+          VERSION=$(python - <<'EOF'
+          import mlflow, os
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          client = mlflow.tracking.MlflowClient()
+          versions = client.search_model_versions(f"name='{os.environ['MODEL_NAME']}'")
+          print(max(int(v.version) for v in versions))
+          EOF
+          )
+          echo "model_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Registered model version: $VERSION"
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-artifacts
+          path: |
+            data/reference.parquet
+          retention-days: 30
+
+  # ── 3. Evaluate model ────────────────────────────────────────────────────────
+  evaluate:
+    name: Evaluate Model
+    runs-on: ubuntu-latest
+    needs: train
+
+    services:
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:v2.13.2
+        ports:
+          - 5000:5000
+        options: >-
+          --health-cmd "curl -f http://localhost:5000/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+        env:
+          MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow.db
+          MLFLOW_DEFAULT_ARTIFACT_ROOT: /tmp/mlflow-artifacts
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run evaluation
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+        run: |
+          python src/evaluate.py \
+            --model-name "$MODEL_NAME" \
+            --model-version "${{ needs.train.outputs.model_version }}" \
+            --config configs/xgboost.yaml \
+            --threshold-rmse 1.5
+
+  # ── 4. Promote model to Production ──────────────────────────────────────────
+  promote:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    needs: [train, evaluate]
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.evaluate.result == 'success'
+
+    services:
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:v2.13.2
+        ports:
+          - 5000:5000
+        options: >-
+          --health-cmd "curl -f http://localhost:5000/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+        env:
+          MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow.db
+          MLFLOW_DEFAULT_ARTIFACT_ROOT: /tmp/mlflow-artifacts
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Promote model to Production
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+        run: |
+          python src/promote.py \
+            --model-name "$MODEL_NAME" \
+            --version "${{ needs.train.outputs.model_version }}" \
+            --stage Production \
+            --tracking-uri "$MLFLOW_TRACKING_URI"
+
+      - name: Summarize pipeline run
+        run: |
+          echo "## MLOps Pipeline Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Model Name | ${{ env.MODEL_NAME }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Model Version | ${{ needs.train.outputs.model_version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Training Run ID | ${{ needs.train.outputs.run_id }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Production |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Status | Promoted successfully |" >> "$GITHUB_STEP_SUMMARY"

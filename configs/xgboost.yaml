@@ -1,0 +1,39 @@
+# XGBoost Model Configuration
+model:
+  name: "MLOpsDemoModel"
+  version: "1.0.0"
+
+hyperparameters:
+  n_estimators: 300
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 3
+  gamma: 0.1
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  objective: "reg:squarederror"
+  eval_metric: "rmse"
+  random_state: 42
+
+data:
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  target_column: "MedHouseVal"
+
+mlflow:
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "california-housing-xgboost"
+  model_name: "MLOpsDemoModel"
+  artifact_path: "xgboost_model"
+  registered_model_tags:
+    framework: "xgboost"
+    dataset: "california_housing"
+    task: "regression"
+
+training:
+  early_stopping_rounds: 30
+  verbose_eval: 50
+  log_feature_importance: true
