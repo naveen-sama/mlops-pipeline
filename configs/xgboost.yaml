@@ -4,18 +4,19 @@ model:
   version: "1.0.0"
 
 hyperparameters:
-  n_estimators: 300
-  max_depth: 6
-  learning_rate: 0.05
-  subsample: 0.8
-  colsample_bytree: 0.8
-  min_child_weight: 3
-  gamma: 0.1
-  reg_alpha: 0.1
-  reg_lambda: 1.0
+  n_estimators: 500
+  max_depth: 5
+  learning_rate: 0.03
+  subsample: 0.85
+  colsample_bytree: 0.75
+  min_child_weight: 5
+  gamma: 0.05
+  reg_alpha: 0.05
+  reg_lambda: 1.2
   objective: "reg:squarederror"
-  eval_metric: "rmse"
+  eval_metric: ["rmse", "mae"]
   random_state: 42
+  tree_method: "hist"
 
 data:
   test_size: 0.2
@@ -34,6 +35,8 @@ mlflow:
     task: "regression"
 
 training:
-  early_stopping_rounds: 30
-  verbose_eval: 50
+  early_stopping_rounds: 20
+  verbose_eval: 100
   log_feature_importance: true
+  cross_validate: true
+  cv_folds: 5
